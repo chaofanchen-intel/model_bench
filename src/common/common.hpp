@@ -70,10 +70,15 @@ inline std::string openvino_genai_version_string() {
 }
 
 // Parse a JSON object of plugin properties into a string->string map.
-// Values are stringified (numbers/bools -> their textual form), matching
-// tests/lib/cli.py:load_extra_ov_config.
-inline std::map<std::string, std::string> load_extra_ov_config(const std::string& path) {
-    std::map<std::string, std::string> out;
+// Parse into an ov::AnyMap preserving native JSON types. This matters for NPU
+// LLM properties (MAX_PROMPT_LEN / MIN_RESPONSE_LEN / NPUW_LLM_PREFILL_CHUNK_SIZE),
+// which GenAI extracts via pop_int_and_cast() requiring int/int64_t (see
+// openvino.genai src/cpp/src/utils.cpp) and throws "Type mismatch: expected types:
+// int or int64_t" if handed a string. Integers are stored as int64_t (Python ints
+// arrive as int64_t too), bool/double/string keep their native type; generic
+// CPU/GPU string properties (PERFORMANCE_HINT, ATTENTION_BACKEND, ...) stay strings.
+inline ov::AnyMap load_extra_ov_config(const std::string& path) {
+    ov::AnyMap out;
     std::ifstream in(path, std::ios::binary);
     if (!in.good()) {
         throw std::runtime_error("could not open load-config file: " + path);
@@ -89,15 +94,10 @@ inline std::map<std::string, std::string> load_extra_ov_config(const std::string
         const json::ValuePtr& val = kv.second;
         switch (val->type) {
             case json::Type::String: out[kv.first] = val->s; break;
-            case json::Type::Bool: out[kv.first] = val->b ? "true" : "false"; break;
-            case json::Type::Int: out[kv.first] = std::to_string(val->i); break;
-            case json::Type::Double: {
-                std::ostringstream tmp;
-                tmp << val->d;
-                out[kv.first] = tmp.str();
-                break;
-            }
-            default: out[kv.first] = ""; break;
+            case json::Type::Bool: out[kv.first] = val->b; break;
+            case json::Type::Int: out[kv.first] = static_cast<int64_t>(val->i); break;
+            case json::Type::Double: out[kv.first] = val->d; break;
+            default: out[kv.first] = std::string(); break;
         }
     }
     return out;
