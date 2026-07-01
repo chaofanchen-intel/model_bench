@@ -1,0 +1,18 @@
+# Build output
+/build/
+/build-local/
+build*/
+*.o
+*.so
+*.a
+
+# Benchmark run artifacts (created on first run)
+/results/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+__pycache__/
