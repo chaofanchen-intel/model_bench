@@ -5,10 +5,17 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <filesystem>
 #include <set>
 
 #include "common/common.hpp"
+#include "openvino/op/add.hpp"
+#include "openvino/op/constant.hpp"
+#include "openvino/op/gather.hpp"
+#include "openvino/op/matmul.hpp"
+#include "openvino/op/parameter.hpp"
+#include "openvino/pass/sdpa_to_paged_attention.hpp"
 
 namespace mb {
 
@@ -380,6 +387,317 @@ bool deep_profile_encoder(const DeepProfileConfig& cfg, ov::genai::Tokenizer& to
     if (cfg.profile_csv) {
         write_profiling_csv(*cfg.profile_csv, acc, path_name(cfg.model_dir), cfg.device, cfg.precision,
                             stage, iters);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// PagedAttention-graph profiling
+// ---------------------------------------------------------------------------
+//
+// ov::genai::LLMPipeline defaults to ATTENTION_BACKEND=PA, so deep_profile_llm()
+// above profiles a graph the benchmark never runs. This path rebuilds what
+// ContinuousBatchingPipeline builds:
+//
+//   ov::pass::SDPAToPagedAttention(false, false, /*score_aggregation*/ true, ...)
+//   + gather-before-lm_head (only the sampled rows reach the vocab MatMul)
+//
+// then compiles it, reads the KV-cache block layout back out of the compiled
+// model exactly like GenAI's KVCacheManager does, allocates the blocks, and
+// drives a single-sequence prefill plus `gen_tokens` decode steps.
+
+namespace {
+
+// Mirrors ov::genai::utils::find_llm_matmul: locate the vocab-projection MatMul
+// so a Gather can be inserted in front of it. For a PA graph tokens live in the
+// batch dimension, so the gather axis is 0.
+std::shared_ptr<ov::Node> find_vocab_matmul(const std::shared_ptr<ov::Model>& model) {
+    auto last = model->output(0).get_node()->input_value(0).get_node_shared_ptr();
+    if (auto mm = ov::as_type_ptr<ov::op::v0::MatMul>(last)) return mm;
+    if (auto add = ov::as_type_ptr<ov::op::v1::Add>(last))
+        return ov::as_type_ptr<ov::op::v0::MatMul>(add->input_value(0).get_node_shared_ptr());
+    return nullptr;
+}
+
+// Insert the "sampled_tokens_indices" Gather in front of the vocab MatMul, so
+// prefill projects only the rows that are actually sampled instead of the whole
+// prompt. Returns true when the parameter was added.
+bool apply_gather_before_vocab_matmul(const std::shared_ptr<ov::Model>& model) {
+    auto matmul = find_vocab_matmul(model);
+    if (!matmul) return false;
+    const auto rank = matmul->input(0).get_partial_shape().rank();
+    if (rank.is_dynamic()) return false;
+    // PA moves all tokens into the batch dimension -> gather along axis 0.
+    const int64_t axis_val = (rank.get_length() == 3) ? 1 : 0;
+    auto indices = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{-1});
+    indices->set_friendly_name("sampled_tokens_indices");
+    indices->output(0).get_tensor().set_names({"sampled_tokens_indices"});
+    auto axis = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{1},
+                                                       std::vector<int64_t>{axis_val});
+    auto gather = std::make_shared<ov::op::v8::Gather>(matmul->input_value(0), indices, axis);
+    matmul->input(0).replace_source_output(gather);
+    model->add_parameters({indices});
+    model->validate_nodes_and_infer_types();
+    return true;
+}
+
+ov::Tensor i32_tensor(const ov::Shape& shape, const std::vector<int32_t>& data) {
+    ov::Tensor t(ov::element::i32, shape);
+    std::memcpy(t.data(), data.data(), data.size() * sizeof(int32_t));
+    return t;
+}
+
+// argmax over a [rows, vocab] logits tensor's last row.
+int64_t argmax_last_row(const ov::Tensor& logits) {
+    const auto shape = logits.get_shape();
+    const size_t vocab = shape.back();
+    size_t rows = logits.get_size() / vocab;
+    const float* p = logits.data<const float>() + (rows - 1) * vocab;
+    int64_t best = 0;
+    float best_v = p[0];
+    for (size_t i = 1; i < vocab; ++i) {
+        if (p[i] > best_v) {
+            best_v = p[i];
+            best = static_cast<int64_t>(i);
+        }
+    }
+    return best;
+}
+
+}  // namespace
+
+bool deep_profile_llm_pa(const DeepProfileConfig& cfg, ov::genai::Tokenizer& tokenizer) {
+    fs::path xml = fs::path(cfg.model_dir) / "openvino_model.xml";
+    if (!fs::exists(xml)) {
+        std::printf("  [deep-profile/PA] openvino_model.xml not found; skipping.\n");
+        return false;
+    }
+
+    ov::Core core;
+    std::shared_ptr<ov::Model> model;
+    bool has_sampled_idx = false;
+    try {
+        model = core.read_model(xml.string());
+        // allow_score_aggregation=true matches ContinuousBatchingImpl.
+        ov::pass::SDPAToPagedAttention(false, false, true, false, false, false).run_on_model(model);
+        model->validate_nodes_and_infer_types();
+        has_sampled_idx = apply_gather_before_vocab_matmul(model);
+    } catch (const std::exception& e) {
+        std::printf("  [deep-profile/PA] SDPAToPagedAttention failed: %s\n", e.what());
+        return false;
+    }
+
+    ov::CompiledModel cm;
+    try {
+        cm = core.compile_model(model, cfg.device, cfg.plugin_cfg);
+    } catch (const std::exception& e) {
+        std::printf("  [deep-profile/PA] compile failed: %s\n", e.what());
+        return false;
+    }
+
+    // Read the KV-cache block layout back out of the COMPILED model, the way
+    // GenAI's KVCacheManager does — the plugin, not the caller, picks the
+    // block layout and cache precision.
+    // The GPU plugin picks the cache precision (u8 by default — the KV cache is
+    // itself dynamically quantized) and a per-block layout that differs between
+    // K and V, so the only safe thing to do is copy dims 1..3 verbatim and vary
+    // dim 0 (the block count), exactly like GenAI's KVCacheManager.
+    struct CacheInput {
+        std::string name;
+        ov::element::Type precision;
+        ov::Shape per_block;  // dims 1..3, copied from the compiled model
+    };
+    std::vector<CacheInput> caches;
+    for (const auto& in : cm.inputs()) {
+        std::string name;
+        for (const auto& n : in.get_names()) {
+            if (n.rfind("key_cache.", 0) == 0 || n.rfind("value_cache.", 0) == 0) {
+                name = n;
+                break;
+            }
+        }
+        if (name.empty()) continue;
+        auto ps = in.get_partial_shape();
+        if (ps.rank().is_dynamic() || ps.rank().get_length() != 4 || ps[1].is_dynamic() ||
+            ps[2].is_dynamic() || ps[3].is_dynamic()) {
+            std::printf("  [deep-profile/PA] %s has an unusable cache shape %s; skipping.\n",
+                        name.c_str(), ps.to_string().c_str());
+            return false;
+        }
+        if (caches.size() < 2)
+            std::printf("  [deep-profile/PA] cache input %s : %s %s\n", name.c_str(),
+                        in.get_element_type().get_type_name().c_str(), ps.to_string().c_str());
+        caches.push_back({name, in.get_element_type(),
+                          ov::Shape{static_cast<size_t>(ps[1].get_length()),
+                                    static_cast<size_t>(ps[2].get_length()),
+                                    static_cast<size_t>(ps[3].get_length())}});
+    }
+    if (caches.empty()) {
+        std::printf("  [deep-profile/PA] no key_cache./value_cache. inputs found; skipping.\n");
+        return false;
+    }
+    // Block size is a device convention, not something derivable from the cache
+    // layout: GenAI uses 32 on CPU and 16 on GPU (256 only for XAttention).
+    const bool is_gpu = cfg.device.find("GPU") != std::string::npos;
+    size_t block_size = is_gpu ? 16 : 32;
+    for (const auto& c : caches) {
+        if (c.name.rfind("value_cache.", 0) == 0 && is_gpu && c.per_block[1] == 256) {
+            block_size = 256;
+            break;
+        }
+    }
+
+    print_device_properties(cm, cfg.device);
+
+    std::vector<int64_t> ids = resolve_prefill_ids(cfg, tokenizer, "LLM/PA");
+    const size_t N = ids.size();
+    const size_t total_len = N + static_cast<size_t>(cfg.gen_tokens) + 1;
+    const size_t num_blocks = (total_len + block_size - 1) / block_size + 1;
+
+    std::printf("  [deep-profile/PA] PagedAttention graph: %zu cache inputs, block_size=%zu, "
+                "%zu blocks allocated, gather_before_lm_head=%s\n",
+                caches.size(), block_size, num_blocks, has_sampled_idx ? "yes" : "no");
+
+    ov::InferRequest req = cm.create_infer_request();
+
+    // KV cache blocks are persistent across the whole generation and must live
+    // in device memory: GenAI allocates them through the compiled model's
+    // RemoteContext. Host tensors would work functionally but add a full
+    // host<->device copy of the entire cache to every inference, which would
+    // show up as (fictional) prefill time.
+    auto allocate_cache = [&](ov::CompiledModel& target_cm, ov::InferRequest& target_req) {
+        ov::RemoteContext ctx;
+        bool have_ctx = false;
+        try {
+            ctx = target_cm.get_context();
+            have_ctx = true;
+        } catch (const std::exception&) {
+        }
+        for (const auto& c : caches) {
+            ov::Shape shape{num_blocks, c.per_block[0], c.per_block[1], c.per_block[2]};
+            if (have_ctx) {
+                target_req.set_tensor(c.name, ctx.create_tensor(c.precision, shape));
+            } else {
+                ov::Tensor t(c.precision, shape);
+                std::memset(t.data(), 0, t.get_byte_size());
+                target_req.set_tensor(c.name, t);
+            }
+        }
+    };
+
+    // A PA sequence is described by past_lens / subsequence_begins /
+    // block_indices / block_indices_begins; for one sequence the block list is
+    // simply every block we allocated.
+    std::vector<int32_t> block_ids(num_blocks);
+    for (size_t i = 0; i < num_blocks; ++i) block_ids[i] = static_cast<int32_t>(i);
+
+    const bool rank1_ids = cm.input("input_ids").get_partial_shape().rank().get_length() == 1;
+    auto set_ids = [&](const std::vector<int64_t>& tok, const std::vector<int64_t>& pos) {
+        ov::Shape s = rank1_ids ? ov::Shape{tok.size()} : ov::Shape{1, tok.size()};
+        req.set_tensor("input_ids", i64_tensor(s, tok));
+        req.set_tensor("position_ids", i64_tensor(s, pos));
+    };
+    auto set_pa_meta = [&](int32_t past_len, int32_t new_tokens, int32_t max_ctx) {
+        req.set_tensor("past_lens", i32_tensor({1}, {past_len}));
+        req.set_tensor("subsequence_begins", i32_tensor({2}, {0, new_tokens}));
+        req.set_tensor("block_indices", i32_tensor({num_blocks}, block_ids));
+        req.set_tensor("block_indices_begins",
+                       i32_tensor({2}, {0, static_cast<int32_t>(num_blocks)}));
+        auto mc = cm.input("max_context_len");
+        req.set_tensor("max_context_len",
+                       i32_tensor(mc.get_partial_shape().rank().get_length() == 0 ? ov::Shape{}
+                                                                                  : ov::Shape{1},
+                                  {max_ctx}));
+        if (has_input(cm, "score_aggregation_window"))
+            req.set_tensor("score_aggregation_window", i32_tensor({1}, {0}));
+    };
+
+    int64_t first_token = -1;
+    double last_prefill_wall_ms = 0.0;
+    auto generate = [&](std::vector<ProfRow>* prefill_acc, std::vector<ProfRow>* decode_acc,
+                        int decode_steps) {
+        std::vector<int64_t> pos(N);
+        for (size_t i = 0; i < N; ++i) pos[i] = static_cast<int64_t>(i);
+        set_ids(ids, pos);
+        set_pa_meta(0, static_cast<int32_t>(N), static_cast<int32_t>(N));
+        if (has_sampled_idx)
+            req.set_tensor("sampled_tokens_indices",
+                           i64_tensor({1}, {static_cast<int64_t>(N) - 1}));
+        auto t0 = std::chrono::steady_clock::now();
+        req.infer();
+        last_prefill_wall_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (prefill_acc) collect_profiling(req, *prefill_acc);
+        int64_t next = argmax_last_row(req.get_tensor("logits"));
+        first_token = next;
+
+        size_t cur = N;
+        for (int step = 0; step < decode_steps; ++step) {
+            set_ids({next}, {static_cast<int64_t>(cur)});
+            set_pa_meta(static_cast<int32_t>(cur), 1, static_cast<int32_t>(cur + 1));
+            if (has_sampled_idx) req.set_tensor("sampled_tokens_indices", i64_tensor({1}, {0}));
+            req.infer();
+            if (decode_acc) collect_profiling(req, *decode_acc);
+            next = argmax_last_row(req.get_tensor("logits"));
+            ++cur;
+        }
+    };
+
+    std::printf("  [deep-profile/PA] real greedy loop: prompt=%zu tokens, decode=%d tokens, warmup=%d\n",
+                N, cfg.gen_tokens, cfg.warmup);
+    try {
+        allocate_cache(cm, req);
+        for (int w = 0; w < cfg.warmup; ++w) generate(nullptr, nullptr, cfg.gen_tokens);
+        std::vector<ProfRow> prefill_acc, decode_acc;
+        generate(&prefill_acc, &decode_acc, cfg.gen_tokens);
+        const double profiled_wall_ms = last_prefill_wall_ms;
+        std::printf("  [deep-profile/PA] first token id = %lld (%s)\n",
+                    static_cast<long long>(first_token),
+                    tokenizer.decode(std::vector<int64_t>{first_token}).c_str());
+
+        // Per-op profiling serializes the queue, so the profiled wall time is an
+        // upper bound. Re-time the same prefill on a non-profiling compilation:
+        // the gap between that and the sum of kernel times is the host-side /
+        // per-primitive dispatch cost, which for a many-small-primitive dynamic
+        // graph can rival the GPU time itself.
+        double clean_ms = 0.0;
+        try {
+            ov::AnyMap clean_cfg = cfg.plugin_cfg;
+            clean_cfg.erase(ov::enable_profiling.name());
+            ov::CompiledModel cm_clean = core.compile_model(model, cfg.device, clean_cfg);
+            req = cm_clean.create_infer_request();
+            allocate_cache(cm_clean, req);
+            // TTFT is measured on a prefill that follows another prefill, not
+            // one that follows decode steps: re-growing every activation buffer
+            // from seq=1 back to seq=N would otherwise be charged to prefill.
+            const int reps = 4;
+            generate(nullptr, nullptr, 0);  // warm the clean compilation
+            for (int i = 0; i < reps; ++i) {
+                generate(nullptr, nullptr, 0);
+                clean_ms += last_prefill_wall_ms;
+            }
+            clean_ms /= reps;
+        } catch (const std::exception& e) {
+            std::printf("  [deep-profile/PA] clean re-timing skipped: %s\n", e.what());
+        }
+        std::printf("  [deep-profile/PA] prefill wall time: %.2f ms profiled / %.2f ms clean\n",
+                    profiled_wall_ms, clean_ms);
+
+        print_profiling_report(prefill_acc,
+                               "LLM/PA PREFILL (" + path_name(cfg.model_dir) + " / " + cfg.device + ")",
+                               cfg.topk, 1);
+        print_profiling_report(decode_acc,
+                               "LLM/PA DECODE (" + path_name(cfg.model_dir) + " / " + cfg.device + ")",
+                               cfg.topk, cfg.gen_tokens);
+        if (cfg.profile_csv) {
+            write_profiling_csv(*cfg.profile_csv, prefill_acc, path_name(cfg.model_dir), cfg.device,
+                                cfg.precision, "pa_prefill", 1);
+            write_profiling_csv(*cfg.profile_csv, decode_acc, path_name(cfg.model_dir), cfg.device,
+                                cfg.precision, "pa_decode", cfg.gen_tokens);
+        }
+    } catch (const std::exception& e) {
+        std::printf("  [deep-profile/PA] inference failed: %s\n", e.what());
+        return false;
     }
     return true;
 }

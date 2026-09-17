@@ -59,6 +59,15 @@ struct DeepProfileConfig {
 // Returns false if the model/graph isn't the expected stateful LLM shape.
 bool deep_profile_llm(const DeepProfileConfig& cfg, ov::genai::Tokenizer& tokenizer);
 
+// PagedAttention-graph profiling. ov::genai::LLMPipeline defaults to
+// ATTENTION_BACKEND=PA, so the stateful SDPA graph that deep_profile_llm()
+// drives is NOT the graph that produces the reported TTFT. This variant
+// reproduces what ContinuousBatchingPipeline builds — SDPAToPagedAttention
+// plus the gather-before-lm_head transformation — allocates the KV cache
+// blocks itself, and profiles a single-sequence prefill (and `gen_tokens`
+// decode steps) on the real PA graph.
+bool deep_profile_llm_pa(const DeepProfileConfig& cfg, ov::genai::Tokenizer& tokenizer);
+
 // VLM text-only language-model profiling (text_embeddings -> language_model).
 bool deep_profile_vlm(const DeepProfileConfig& cfg, ov::genai::Tokenizer& tokenizer);
 

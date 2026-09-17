@@ -86,6 +86,10 @@ struct Args {
     int profile_warmup = 3;
     int profile_iters = 10;
     std::optional<std::string> profile_csv;
+    // Which decoder graph to profile. LLMPipeline defaults to
+    // ATTENTION_BACKEND=PA, so "pa" is what the reported TTFT actually runs;
+    // "sdpa" profiles the stateful graph; "both" profiles each in turn.
+    std::string profile_graph = "pa";
 
     // IO
     std::string csv_out;   // defaults filled per-task

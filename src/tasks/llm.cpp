@@ -416,6 +416,10 @@ int run_llm(const Args& args) {
                 dp.device = device;
                 dp.precision = precision;
                 dp.plugin_cfg = build_plugin_config(args, device, "", true);
+                // Match the generation path's plugin config so the profiled
+                // graph is compiled exactly like the one that was benchmarked.
+                if (device != "NPU" && dp.plugin_cfg.find("PERFORMANCE_HINT") == dp.plugin_cfg.end())
+                    dp.plugin_cfg["PERFORMANCE_HINT"] = "LATENCY";
                 dp.prompt_tokens = use_input_tokens ? *args.input_tokens : 64;
                 // Profile the REAL prompt that the benchmark ran (-pf / --prompt),
                 // not a synthetic one, so per-op hotspots reflect the true prefill
@@ -437,7 +441,13 @@ int run_llm(const Args& args) {
                 dp.warmup = args.profile_warmup;
                 dp.topk = args.profile_topk;
                 dp.profile_csv = args.profile_csv;
-                deep_profile_llm(dp, tokenizer);
+                // The generation loop above ran on ATTENTION_BACKEND=PA, so the
+                // PA graph is the one whose hotspots explain the reported TTFT.
+                // The stateful SDPA graph is available for comparison.
+                const bool want_pa = args.profile_graph != "sdpa";
+                const bool want_sdpa = args.profile_graph != "pa";
+                if (want_pa) deep_profile_llm_pa(dp, tokenizer);
+                if (want_sdpa) deep_profile_llm(dp, tokenizer);
             }
 
             pipe.reset();

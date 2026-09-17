@@ -225,6 +225,8 @@ Args parse_args(int argc, char** argv) {
             a.profile_iters = to_int(take_value(ts, o), o);
         } else if (eq_any(o, {"--profile-csv", "--profile_csv"})) {
             a.profile_csv = take_value(ts, o);
+        } else if (eq_any(o, {"--profile-graph", "--profile_graph"})) {
+            a.profile_graph = take_value(ts, o);
         } else if (eq_any(o, {"-r", "--csv-out", "--csv_out"})) {
             a.csv_out = take_value(ts, o);
         } else if (eq_any(o, {"-rj", "--json-out", "--json_out"})) {
@@ -283,7 +285,8 @@ void print_usage(const std::string& task) {
         "  -r, --csv-out FILE             CSV report (append-mode)\n"
         "  -rj, --json-out FILE           JSON report (append-mode)\n"
         "      --profile                  per-op ProfilingInfo hotspot report\n"
-        "      --profile-csv FILE         write profiling rows to CSV\n\n");
+        "      --profile-csv FILE         write profiling rows to CSV\n"
+        "      --profile-graph WHICH      llm only: pa (default) | sdpa | both\n\n");
     if (task == "llm" || task == "vlm") {
         std::printf(
             "Generation options:\n"
